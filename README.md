@@ -12,12 +12,13 @@ A word of etiquette: it's rude to strip the locks off other people's worksheets.
 
 Strip Excel **protection**, edit the file, then put it back **exactly as it was** - same password hash, same locked options.
 
-No install, no dependencies: pure PowerShell using the .NET ZIP/XML support and WPF that already ship with Windows. **Two files, that's it:**
+No install, no dependencies: pure PowerShell using the .NET ZIP/XML support and WPF that already ship with Windows. **Three small files:**
 
 | File | What it is |
 |------|------------|
 | `PassRe.bat` | The launcher you run / double-click / drag files onto. |
 | `PassRe.ps1` | The whole app (engine + CLI + GUI). |
+| `PassRe.Manifest.json` | Version + update source, read by the self-updater. |
 
 ## Run it
 
@@ -36,6 +37,15 @@ PassRe.bat reprotect budget.xlsx
 Also `PassRe.bat status budget.xlsx` and `PassRe.bat toggle budget.xlsx` (unprotect if protected, reprotect if a stash exists).
 
 The launcher runs PowerShell with `-STA -ExecutionPolicy Bypass`, so WPF works and no machine policy needs changing. If `.bat` is blocked on a locked-down machine you can still call the app directly: `powershell -STA -ExecutionPolicy Bypass -File PassRe.ps1 …`
+
+## Updating
+
+PassRe can update itself from its GitHub repo.
+
+- **GUI:** the window footer shows the current version and a **Check for updates** button; it also does a quiet check when it opens. If a newer version exists it offers to install it.
+- **Command line:** `PassRe.bat update` installs the latest; `PassRe.bat update -CheckOnly` just reports whether one is available.
+
+How it works: `PassRe.Manifest.json` holds the version and the GitHub coordinates (`repoOwner` / `repoName` / `branch`). The updater fetches the remote manifest from `raw.githubusercontent.com`, compares versions, and — only if the remote is newer — downloads the listed files to a temp folder, **backs up** the current ones to `backup/<timestamp>/`, then replaces them (and **rolls back** from the backup if anything fails). It never touches file-open encryption; it only swaps its own program files. Point it at a fork or private mirror by editing the manifest's repo fields, or by setting `PASSRE_UPDATE_BASEURL`.
 
 ## What it handles
 

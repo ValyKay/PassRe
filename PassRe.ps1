@@ -7,6 +7,7 @@
     * No arguments .......... opens the GUI.
     * A file path ........... opens the GUI with that workbook loaded (drag-drop).
     * A verb + file ......... command line: unprotect | reprotect | toggle | status
+    * update [-CheckOnly] ... pull the latest version from GitHub (see PassRe.Manifest.json)
 
   An .xlsx is a ZIP of XML. PassRe removes the protection elements - <sheetProtection>
   on worksheets and chart sheets, <workbookProtection> and the "password to modify"
@@ -39,7 +40,8 @@ param(
     [switch]$Quiet,
     [switch]$Gui,
     [switch]$SelfTest,     # build the GUI headless and exit (used by tests)
-    [switch]$AsLibrary     # dot-source target: define functions, then return
+    [switch]$AsLibrary,    # dot-source target: define functions, then return
+    [switch]$CheckOnly     # update: report whether a newer version exists, don't install
 )
 
 $ErrorActionPreference = 'Stop'
@@ -47,6 +49,12 @@ try {
     Add-Type -AssemblyName System.IO.Compression -ErrorAction SilentlyContinue
     Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
 } catch { }
+
+# ---- self-update configuration ----------------------------------------------
+$script:AppRoot               = $PSScriptRoot
+$script:ManifestPath          = Join-Path $script:AppRoot 'PassRe.Manifest.json'
+$script:UpdateBaseUrlOverride = $env:PASSRE_UPDATE_BASEURL   # private mirror / tests; else GitHub raw
+$script:CheckUpdatesOnLaunch  = $true                        # GUI: quiet check when the window opens
 
 #region ============================ ENGINE ====================================
 
@@ -251,6 +259,135 @@ function Invoke-PassReReprotect {
     return [pscustomobject]@{ Restored = $restored }
 }
 
+# ---- self-update (manifest + GitHub raw, with backup / rollback) -------------
+
+function Enable-Tls12 {
+    try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
+}
+
+function Get-LocalManifest {
+    if (-not (Test-Path -LiteralPath $script:ManifestPath)) { return $null }
+    try { return (Get-Content -LiteralPath $script:ManifestPath -Raw | ConvertFrom-Json) } catch { return $null }
+}
+
+function Get-PassReVersion {
+    $m = Get-LocalManifest
+    if ($m -and ($m.PSObject.Properties.Name -contains 'version')) { return [string]$m.version }
+    return $null
+}
+
+function Assert-ManifestShape {
+    param($Manifest, [string]$Label)
+    foreach ($p in 'appName', 'version', 'repoOwner', 'repoName', 'branch', 'files') {
+        if (-not ($Manifest.PSObject.Properties.Name -contains $p)) { throw ("{0} is missing '{1}'." -f $Label, $p) }
+    }
+    if ([string]::IsNullOrWhiteSpace([string]$Manifest.version)) { throw ("{0} 'version' is empty." -f $Label) }
+    if (@($Manifest.files).Count -lt 1) { throw ("{0} 'files' is empty." -f $Label) }
+    foreach ($core in 'PassRe.ps1', 'PassRe.bat', 'PassRe.Manifest.json') {
+        if (@($Manifest.files) -notcontains $core) { throw ("{0} 'files' is missing '{1}'." -f $Label, $core) }
+    }
+}
+
+function Get-RawBaseUrl {
+    param($Manifest)
+    if ($script:UpdateBaseUrlOverride) { return ([string]$script:UpdateBaseUrlOverride).TrimEnd('/') }
+    return ('https://raw.githubusercontent.com/{0}/{1}/{2}' -f $Manifest.repoOwner, $Manifest.repoName, $Manifest.branch)
+}
+
+function Compare-PassReVersion {
+    param([string]$Left, [string]$Right)
+    try { return ([version]$Left).CompareTo([version]$Right) }
+    catch { return [string]::Compare($Left, $Right, [System.StringComparison]::OrdinalIgnoreCase) }
+}
+
+function Get-RemoteManifest {
+    param([string]$BaseUrl)
+    Enable-Tls12
+    $resp = Invoke-WebRequest -Uri ('{0}/PassRe.Manifest.json' -f $BaseUrl) -UseBasicParsing -TimeoutSec 20 -ErrorAction Stop
+    $txt = ([string]$resp.Content).TrimStart([char]0xFEFF)   # tolerate a UTF-8 BOM in the served file
+    return ($txt | ConvertFrom-Json -ErrorAction Stop)
+}
+
+function Get-FriendlyUpdateError {
+    param([string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return 'Update failed.' }
+    if ($Text -match '(?i)was empty|empty response|zero bytes') { return 'A downloaded file was empty - usually transient. Retry, or check your network/proxy.' }
+    if ($Text -match '(404|Not Found)') { return 'No update source found yet. Publish the repo, or check repoOwner/repoName/branch in PassRe.Manifest.json.' }
+    if ($Text -match '(?i)could not be resolved|name resolution|no such host|could not resolve') { return 'Could not reach the update host. Check your network connection.' }
+    if ($Text -match '(?i)ssl|tls|secure channel|trust relationship') { return 'TLS negotiation failed. A TLS-inspecting proxy may be the cause.' }
+    if ($Text -match '(?i)401|403|unauthori|forbidden') { return 'The update source returned an auth error. Check the repo/branch in PassRe.Manifest.json.' }
+    return "Update failed: $Text"
+}
+
+function Invoke-PassReSelfUpdate {
+    param([switch]$CheckOnly, [scriptblock]$Confirm, [switch]$Force)
+
+    $local = Get-LocalManifest
+    if (-not $local) { throw "No PassRe.Manifest.json beside the app - can't check for updates." }
+    Assert-ManifestShape -Manifest $local -Label 'Local manifest'
+    $remote = Get-RemoteManifest -BaseUrl (Get-RawBaseUrl -Manifest $local)
+    Assert-ManifestShape -Manifest $remote -Label 'Remote manifest'
+
+    if ((Compare-PassReVersion $remote.version $local.version) -le 0) {
+        Write-Log "You're on the latest version (v$($local.version))." 'ok'
+        return [pscustomobject]@{ Updated = $false; UpToDate = $true; Current = $local.version; Remote = $remote.version }
+    }
+    Write-Log "Update available: v$($local.version) -> v$($remote.version)" 'head'
+    if ($CheckOnly) { return [pscustomobject]@{ Updated = $false; UpToDate = $false; Current = $local.version; Remote = $remote.version } }
+    if (-not $Force -and $Confirm -and -not (& $Confirm $local.version $remote.version)) {
+        Write-Log 'Update cancelled.' 'muted'
+        return [pscustomobject]@{ Updated = $false; UpToDate = $false; Cancelled = $true; Current = $local.version; Remote = $remote.version }
+    }
+
+    $remoteBase = Get-RawBaseUrl -Manifest $remote
+    $files = @($remote.files)
+    $ts = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $backupRoot = Join-Path $script:AppRoot "backup\$ts"
+    $stageRoot = Join-Path ([System.IO.Path]::GetTempPath()) "PassRe\update-$ts"
+    New-Item -ItemType Directory -Path $backupRoot -Force | Out-Null
+    New-Item -ItemType Directory -Path $stageRoot -Force | Out-Null
+
+    # Phase 1: download everything to staging and verify, before touching the install.
+    Enable-Tls12
+    foreach ($f in $files) {
+        $stage = Join-Path $stageRoot $f
+        New-Item -ItemType Directory -Path (Split-Path -Parent $stage) -Force | Out-Null
+        Invoke-WebRequest -Uri ('{0}/{1}' -f $remoteBase, $f) -OutFile $stage -UseBasicParsing -TimeoutSec 60 -ErrorAction Stop
+        if ((Get-Item -LiteralPath $stage).Length -le 0) { throw "Downloaded file '$f' was empty." }
+    }
+
+    # Phase 2: back up current files, then replace; roll back on any failure.
+    $replaced = New-Object System.Collections.Generic.List[string]
+    try {
+        foreach ($f in $files) {
+            $cur = Join-Path $script:AppRoot $f
+            if (Test-Path -LiteralPath $cur) {
+                $bf = Join-Path $backupRoot $f
+                New-Item -ItemType Directory -Path (Split-Path -Parent $bf) -Force | Out-Null
+                Copy-Item -LiteralPath $cur -Destination $bf -Force
+            }
+        }
+        $order = @($files | Where-Object { $_ -ne 'PassRe.ps1' }) + @($files | Where-Object { $_ -eq 'PassRe.ps1' })
+        foreach ($f in $order) {
+            Copy-Item -LiteralPath (Join-Path $stageRoot $f) -Destination (Join-Path $script:AppRoot $f) -Force
+            $replaced.Add($f)
+            Write-Log "Updated $f" 'ok'
+        }
+    } catch {
+        foreach ($f in $replaced) {
+            $bf = Join-Path $backupRoot $f
+            $cur = Join-Path $script:AppRoot $f
+            if (Test-Path -LiteralPath $bf) { Copy-Item -LiteralPath $bf -Destination $cur -Force }
+            elseif (Test-Path -LiteralPath $cur) { Remove-Item -LiteralPath $cur -Force }
+        }
+        throw
+    }
+
+    Write-Log "Updated to v$($remote.version). Restart PassRe to use it." 'head'
+    Write-Log "Backup of the previous version: $backupRoot" 'muted'
+    return [pscustomobject]@{ Updated = $true; Current = $local.version; Remote = $remote.version; Backup = $backupRoot }
+}
+
 #endregion
 
 #region ============================= GUI ======================================
@@ -289,6 +426,97 @@ function Set-GuiFile {
 }
 
 function Get-GuiOpt { @{ NoBackup = (-not $script:UI.BackupChk.IsChecked); KeepSidecar = [bool]$script:UI.KeepStashChk.IsChecked } }
+
+# Non-blocking update check: fetch the remote version on a background runspace,
+# poll for completion with a DispatcherTimer so the window never freezes.
+function Start-GuiUpdateCheck {
+    param([switch]$Silent)
+    if ($script:UI.UpdateBusy) { return }
+    $local = Get-LocalManifest
+    if (-not $local) {
+        if (-not $Silent) { [System.Windows.MessageBox]::Show('No PassRe.Manifest.json beside the app, so updates cannot be checked.', 'Updates', [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning) | Out-Null }
+        return
+    }
+    $url = '{0}/PassRe.Manifest.json' -f (Get-RawBaseUrl -Manifest $local)
+    $ps = [powershell]::Create()
+    [void]$ps.AddScript({
+            param($u)
+            $ErrorActionPreference = 'Stop'
+            try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
+            try {
+                $r = Invoke-WebRequest -Uri $u -UseBasicParsing -TimeoutSec 20 -ErrorAction Stop
+                $m = (([string]$r.Content).TrimStart([char]0xFEFF)) | ConvertFrom-Json -ErrorAction Stop
+                $v = [string]$m.version
+                if ([string]::IsNullOrWhiteSpace($v)) { [pscustomobject]@{ Ok = $false; Error = 'Remote manifest has no version.' } }
+                else { [pscustomobject]@{ Ok = $true; Version = $v } }
+            } catch { [pscustomobject]@{ Ok = $false; Error = $_.Exception.Message } }
+        }).AddArgument($url)
+    $script:UI.UpdateBusy = $true
+    $script:UI.UpdateSilent = [bool]$Silent
+    $script:UI.UpdateLocalVer = [string]$local.version
+    $script:UI.UpdatePS = $ps
+    $script:UI.UpdateHandle = $ps.BeginInvoke()
+    $t = New-Object System.Windows.Threading.DispatcherTimer
+    $t.Interval = [TimeSpan]::FromMilliseconds(150)
+    $t.Add_Tick({ Complete-GuiUpdateCheck })
+    $script:UI.UpdateTimer = $t
+    if (-not $Silent) { Write-Log 'Checking for updates...' 'muted'; $script:UI.UpdateBtn.IsEnabled = $false }
+    $t.Start()
+}
+
+function Complete-GuiUpdateCheck {
+    if (-not $script:UI.UpdateHandle.IsCompleted) { return }
+    $script:UI.UpdateTimer.Stop()
+    $res = $null; $err = $null
+    try { $res = @($script:UI.UpdatePS.EndInvoke($script:UI.UpdateHandle))[0] } catch { $err = $_.Exception.Message }
+    try { $script:UI.UpdatePS.Dispose() } catch { }
+    $silent = $script:UI.UpdateSilent
+    $script:UI.UpdateBusy = $false
+    $script:UI.UpdateBtn.IsEnabled = $true
+
+    if ($err -or -not $res -or -not $res.Ok) {
+        $detail = if ($err) { $err } elseif ($res) { [string]$res.Error } else { 'Unknown error.' }
+        $msg = Get-FriendlyUpdateError $detail
+        if ($silent) { Write-Log "Update check skipped: $msg" 'muted' }
+        else { Write-Log "Update check failed: $msg" 'warn'; [System.Windows.MessageBox]::Show($msg, 'Update check failed', [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Warning) | Out-Null }
+        return
+    }
+
+    $remote = [string]$res.Version
+    $localV = [string]$script:UI.UpdateLocalVer
+    if ((Compare-PassReVersion $remote $localV) -le 0) {
+        $script:UI.PendingVersion = $null
+        $script:UI.UpdateBtn.Content = 'Check for updates'
+        if ($silent) { Write-Log "Up to date (v$localV)." 'muted' }
+        else { Write-Log "Up to date (v$localV)." 'ok'; [System.Windows.MessageBox]::Show("You're on the latest version (v$localV).", 'No updates', [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information) | Out-Null }
+        return
+    }
+
+    $script:UI.PendingVersion = $remote
+    $script:UI.UpdateBtn.Content = "Update to v$remote"
+    Write-Log "Update available: v$localV -> v$remote" 'head'
+    if (-not $silent) { Invoke-GuiUpdateInstall }
+}
+
+function Invoke-GuiUpdateInstall {
+    if (-not $script:UI.PendingVersion) { Start-GuiUpdateCheck; return }
+    $remote = [string]$script:UI.PendingVersion
+    $localV = [string]$script:UI.UpdateLocalVer
+    $ans = [System.Windows.MessageBox]::Show("Update available: v$localV -> v$remote.`r`n`r`nInstall now?", 'Update available', [System.Windows.MessageBoxButton]::YesNo, [System.Windows.MessageBoxImage]::Question)
+    if ($ans -ne [System.Windows.MessageBoxResult]::Yes) { return }
+    try {
+        $script:UI.Win.Cursor = [System.Windows.Input.Cursors]::Wait
+        $r = Invoke-PassReSelfUpdate -Force
+        if ($r.Updated) {
+            $script:UI.PendingVersion = $null
+            $script:UI.UpdateBtn.Content = 'Check for updates'
+            [System.Windows.MessageBox]::Show("Updated to v$($r.Remote). Restart PassRe to use the new version.", 'Update complete', [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Information) | Out-Null
+        }
+    } catch {
+        Write-Log "Update failed: $($_.Exception.Message)" 'err'
+        [System.Windows.MessageBox]::Show((Get-FriendlyUpdateError $_.Exception.Message), 'Update failed', [System.Windows.MessageBoxButton]::OK, [System.Windows.MessageBoxImage]::Error) | Out-Null
+    } finally { $script:UI.Win.Cursor = $null }
+}
 
 function Build-PassReGui {
     Add-Type -AssemblyName PresentationFramework
@@ -337,6 +565,7 @@ function Build-PassReGui {
     <Grid.RowDefinitions>
       <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
       <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/>
+      <RowDefinition Height="Auto"/>
     </Grid.RowDefinitions>
 
     <StackPanel Grid.Row="0" Margin="0,0,0,14">
@@ -384,12 +613,18 @@ function Build-PassReGui {
     <Border Grid.Row="5" Background="#1A202C" CornerRadius="8" Padding="8">
       <TextBox x:Name="LogBox" IsReadOnly="True" Background="Transparent" Foreground="#E2E8F0" BorderThickness="0" FontFamily="Consolas" FontSize="12" TextWrapping="Wrap" VerticalScrollBarVisibility="Auto"/>
     </Border>
+
+    <Grid Grid.Row="6" Margin="0,10,0,0">
+      <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+      <TextBlock x:Name="VersionText" Grid.Column="0" Foreground="#A0AEC0" VerticalAlignment="Center"/>
+      <Button x:Name="UpdateBtn" Grid.Column="1" Content="Check for updates" Style="{StaticResource Ghost}" Width="170" Height="30" FontSize="12"/>
+    </Grid>
   </Grid>
 </Window>
 '@
     $win = [Windows.Markup.XamlReader]::Load((New-Object System.Xml.XmlNodeReader ([xml]$xaml)))
     $script:UI = @{ Win = $win; File = $null }
-    foreach ($n in 'DropZone', 'FileText', 'PathText', 'BrowseBtn', 'WbVal', 'FsVal', 'ShVal', 'ChVal', 'StVal', 'UnprotectBtn', 'ReprotectBtn', 'ToggleBtn', 'BackupChk', 'KeepStashChk', 'LogBox') { $script:UI[$n] = $win.FindName($n) }
+    foreach ($n in 'DropZone', 'FileText', 'PathText', 'BrowseBtn', 'WbVal', 'FsVal', 'ShVal', 'ChVal', 'StVal', 'UnprotectBtn', 'ReprotectBtn', 'ToggleBtn', 'BackupChk', 'KeepStashChk', 'LogBox', 'VersionText', 'UpdateBtn') { $script:UI[$n] = $win.FindName($n) }
 
     Set-PassReLogSink {
         param($m, $l)
@@ -410,6 +645,12 @@ function Build-PassReGui {
             Update-GuiStatus
         })
 
+    $ver = Get-PassReVersion
+    $script:UI.VersionText.Text = if ($ver) { "PassRe v$ver" } else { 'PassRe (version unknown)' }
+    $script:UI.PendingVersion = $null
+    $script:UI.UpdateBusy = $false
+    $script:UI.UpdateBtn.Add_Click({ if ($script:UI.PendingVersion) { Invoke-GuiUpdateInstall } else { Start-GuiUpdateCheck } })
+
     Write-Log 'Ready. Drop a workbook or click Browse.' 'muted'
     return $win
 }
@@ -419,6 +660,7 @@ function Show-PassReGui {
     $win = Build-PassReGui
     if ($Preload) { Set-GuiFile $Preload } else { Update-GuiStatus }
     if ($BuildOnly) { return $win }
+    if ($script:CheckUpdatesOnLaunch) { Start-GuiUpdateCheck -Silent }
     [void]$win.ShowDialog()
 }
 
@@ -450,6 +692,18 @@ if ($Gui) { $pre = if ($Action -and (Test-Path -LiteralPath $Action)) { $Action 
 if (-not $Action) { Start-PassReGui -Preload ''; return }
 
 $verb = $Action.ToLowerInvariant()
+
+if ($verb -eq 'update') {
+    $confirm = {
+        param($from, $to)
+        $ans = Read-Host "Install update v$from -> v$to? [y/N]"
+        return ($ans -match '^(?i)y(es)?$')
+    }
+    try { [void](Invoke-PassReSelfUpdate -CheckOnly:$CheckOnly -Confirm $confirm -Force:$Force) }
+    catch { Write-Log (Get-FriendlyUpdateError $_.Exception.Message) 'err' }
+    return
+}
+
 if ($verbs -contains $verb) {
     if (-not $Path) { throw "Usage: PassRe $verb <file.xlsx>" }
     $opt = @{ Sidecar = $Sidecar; NoBackup = [bool]$NoBackup; KeepSidecar = [bool]$KeepSidecar; Force = [bool]$Force }
@@ -479,6 +733,6 @@ if ($verbs -contains $verb) {
 # Not a verb: a dropped/opened file -> GUI preloaded.
 if (Test-Path -LiteralPath $Action) { Start-PassReGui -Preload $Action; return }
 
-throw "Unknown action '$Action'. Use: unprotect|reprotect|toggle|status <file.xlsx>, give a file to open the GUI on it, or run with no arguments for the GUI."
+throw "Unknown action '$Action'. Use: unprotect|reprotect|toggle|status <file.xlsx>, update [-CheckOnly], a file to open the GUI on it, or no arguments for the GUI."
 
 #endregion

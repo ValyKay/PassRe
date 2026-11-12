@@ -2,6 +2,9 @@
 *.passre
 *.bak
 
+# Self-update backups of the previous version
+backup/
+
 # Excel's own lock / autosave files
 ~$*.xls*
 

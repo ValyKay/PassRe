@@ -16,7 +16,7 @@ if "%~1"=="" (
 )
 
 rem A verb -> run on the console so output is visible.
-for %%V in (unprotect reprotect toggle status) do if /I "%~1"=="%%V" (
+for %%V in (unprotect reprotect toggle status update) do if /I "%~1"=="%%V" (
     %PS% -File "%APP%" %*
     goto :eof
 )

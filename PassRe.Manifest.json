@@ -1,0 +1,13 @@
+{
+  "appName": "PassRe",
+  "version": "1.0.0",
+  "updateChannel": "stable",
+  "repoOwner": "ValyKay",
+  "repoName": "PassRe",
+  "branch": "main",
+  "files": [
+    "PassRe.ps1",
+    "PassRe.bat",
+    "PassRe.Manifest.json"
+  ]
+}
