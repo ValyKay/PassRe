@@ -1,5 +1,6 @@
 # PassRe runtime artifacts (created next to the workbooks it operates on)
 *.passre
+*.passre.tmp
 *.bak
 
 # Self-update backups of the previous version
@@ -7,8 +8,13 @@ backup/
 
 # Excel's own lock / autosave files
 ~$*.xls*
+~$*.xlt*
 
 # OS cruft
 Thumbs.db
 desktop.ini
 .DS_Store
+
+# Local AI orientation (not shared)
+/CLAUDE.md
+/AGENTS.md
