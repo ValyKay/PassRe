@@ -1,0 +1,11 @@
+# PassRe runtime artifacts (created next to the workbooks it operates on)
+*.passre
+*.bak
+
+# Excel's own lock / autosave files
+~$*.xls*
+
+# OS cruft
+Thumbs.db
+desktop.ini
+.DS_Store
